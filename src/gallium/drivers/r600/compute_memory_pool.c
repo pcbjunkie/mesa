@@ -84,9 +84,29 @@ static void compute_memory_pool_init(struct compute_memory_pool * pool,
 	COMPUTE_DBG(pool->screen, "* compute_memory_pool_init() initial_size_in_dw = %u\n",
 		initial_size_in_dw);
 
-	pool->size_in_dw = initial_size_in_dw;
-	pool->bo = r600_compute_buffer_alloc_vram(pool->screen,
-						  pool->size_in_dw * 4);
+	unsigned minimum_size_in_dw = initial_size_in_dw;
+	/* Diagnostic opt-in: reserve one bounded contiguous global pool up front.
+	 * Avoid incremental old/new pool copies fragmenting non-GPUVM VRAM. */
+	const char *reserve = getenv("R600_POOL_RESERVE_MB");
+	if (reserve) {
+		char *end = NULL;
+		unsigned long mb = strtoul(reserve, &end, 10);
+		if (end != reserve && *end == '\0' && mb > 0 && mb <= 1024) {
+			unsigned reserve_dw = (unsigned)(mb * 1024 * 1024 / 4);
+			initial_size_in_dw = MAX2(initial_size_in_dw, reserve_dw);
+		}
+	}
+	pool->bo = r600_compute_buffer_alloc_vram(pool->screen, initial_size_in_dw * 4);
+	/* An optional reservation must not turn a small viable allocation into
+	 * a null pool. Fall back toward the actual required minimum. */
+	while (!pool->bo && initial_size_in_dw > minimum_size_in_dw) {
+		initial_size_in_dw = MAX2(minimum_size_in_dw,
+			align(initial_size_in_dw / 2, ITEM_ALIGNMENT));
+		fprintf(stderr, "r600: optional pool reserve failed; retrying %u bytes\n",
+			initial_size_in_dw * 4);
+		pool->bo = r600_compute_buffer_alloc_vram(pool->screen, initial_size_in_dw * 4);
+	}
+	pool->size_in_dw = pool->bo ? initial_size_in_dw : 0;
 }
 
 /**
@@ -124,6 +144,8 @@ static int compute_memory_grow_defrag_pool(struct compute_memory_pool *pool,
 
 	if (!pool->bo) {
 		compute_memory_pool_init(pool, MAX2(new_size_in_dw, 1024 * 16));
+		if (!pool->bo)
+			return -1;
 	} else {
 		struct r600_resource *temp = NULL;
 
@@ -229,6 +251,23 @@ int compute_memory_finalize_pending(struct compute_memory_pool* pool,
 		return 0;
 	}
 
+	/* Diagnostic: make prior RAT writes visible before pool copies. */
+	if (getenv("R600_POOL_BARRIER") && pool->bo) {
+		struct r600_context *rctx = (struct r600_context *)pipe;
+		rctx->b.flags |= R600_CONTEXT_WAIT_3D_IDLE | R600_CONTEXT_FLUSH_AND_INV;
+		r600_flush_emit(rctx);
+	}
+
+	/* Diagnostic: finish pending dispatches before changing global pool storage. */
+	if (getenv("R600_POOL_WAIT") && pool->bo) {
+		struct pipe_fence_handle *fence = NULL;
+		pipe->flush(pipe, &fence, 0);
+		if (fence) {
+			pipe->screen->fence_finish(pipe->screen, pipe, fence, UINT64_MAX);
+			pipe->screen->fence_reference(pipe->screen, &fence, NULL);
+		}
+	}
+
 	if (pool->size_in_dw < allocated + unallocated) {
 		err = compute_memory_grow_defrag_pool(pool, pipe, allocated + unallocated);
 		if (err == -1)
@@ -241,21 +280,17 @@ int compute_memory_finalize_pending(struct compute_memory_pool* pool,
 			if (!(item->status & ITEM_FOR_PROMOTING))
 				continue;
 
-			int64_t hole_start = 0, hole_size = 0;
-			int64_t item_size = align(item->size_in_dw, ITEM_ALIGNMENT);
-			struct compute_memory_item *alloc_item, *alloc_next;
-			LIST_FOR_EACH_ENTRY_SAFE(alloc_item, alloc_next, pool->item_list, link) {
-				if (alloc_item->start_in_dw == hole_start) {
-					hole_start += align(alloc_item->size_in_dw, ITEM_ALIGNMENT);
-					hole_size = 0;
-				} else if (alloc_item->start_in_dw > hole_start) {
-					hole_size = alloc_item->start_in_dw - hole_start;
-				}
-			}
-
-			/* Space after all items is also a hole. */
-			if (hole_size == 0 && hole_start < pool->size_in_dw)
-				hole_size = pool->size_in_dw - hole_start;
+            int64_t hole_start = 0;
+            int64_t item_size = align(item->size_in_dw, ITEM_ALIGNMENT);
+            struct compute_memory_item *alloc_item;
+            /* item_list is ordered by address: stop at the first fitting gap. */
+            LIST_FOR_EACH_ENTRY(alloc_item, pool->item_list, link) {
+                if (alloc_item->start_in_dw - hole_start >= item_size)
+                    break;
+                hole_start = alloc_item->start_in_dw +
+                    align(alloc_item->size_in_dw, ITEM_ALIGNMENT);
+            }
+            int64_t hole_size = pool->size_in_dw - hole_start;
 
 			if (hole_size >= item_size) {
 				if (compute_memory_promote_item(pool, item, pipe, hole_start) != -1) {
@@ -354,9 +389,17 @@ static int compute_memory_promote_item(struct compute_memory_pool *pool,
 	/* Remove the item from the unallocated list */
 	list_del(&item->link);
 
-	/* Add it back to the item_list */
-	list_addtail(&item->link, pool->item_list);
-	item->start_in_dw = start_in_dw;
+    /* Keep the live list ordered when filling a hole before existing items. */
+    struct compute_memory_item *position;
+    struct list_head *before = pool->item_list;
+    LIST_FOR_EACH_ENTRY(position, pool->item_list, link) {
+        if (position->start_in_dw > start_in_dw) {
+            before = &position->link;
+            break;
+        }
+    }
+    list_addtail(&item->link, before);
+    item->start_in_dw = start_in_dw;
 
 	if (src) {
 		u_box_1d(0, item->size_in_dw * 4, &box);

@@ -511,6 +511,13 @@ void r600_cp_dma_copy_buffer(struct r600_context *rctx,
 	rctx->b.flags |= r600_get_flush_flags(R600_COHERENCY_SHADER) |
 			 R600_CONTEXT_WAIT_3D_IDLE;
 
+	/* Diagnostic: LLVM compute stores use RAT/color-buffer caches. */
+	if (getenv("R600_CP_DMA_CB_FLUSH")) {
+		rctx->b.flags |= R600_CONTEXT_FLUSH_AND_INV;
+		if (atoi(getenv("R600_CP_DMA_CB_FLUSH")) >= 2)
+			rctx->b.flags |= R600_CONTEXT_FLUSH_AND_INV_CB | R600_CONTEXT_CS_PARTIAL_FLUSH;
+	}
+
 	/* There are differences between R700 and EG in CP DMA,
 	 * but we only use the common bits here. */
 	while (size) {
